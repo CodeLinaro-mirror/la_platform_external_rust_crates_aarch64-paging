@@ -8,8 +8,8 @@
 
 use crate::{
     paging::{
-        deallocate, is_aligned, Attributes, MemoryRegion, PageTable, PhysicalAddress, PteUpdater,
-        Translation, VaRange, VirtualAddress, PAGE_SIZE,
+        deallocate, is_aligned, Attributes, Constraints, Descriptor, MemoryRegion, PageTable,
+        PhysicalAddress, Translation, VaRange, VirtualAddress, PAGE_SIZE,
     },
     MapError, Mapping,
 };
@@ -112,24 +112,38 @@ impl LinearMap {
         }
     }
 
-    /// Activates the page table by setting `TTBR0_EL1` to point to it, and saves the previous value
-    /// of `TTBR0_EL1` so that it may later be restored by [`deactivate`](Self::deactivate).
+    /// Activates the page table by setting `TTBRn_EL1` to point to it, and saves the previous value
+    /// of `TTBRn_EL1` so that it may later be restored by [`deactivate`](Self::deactivate).
     ///
-    /// Panics if a previous value of `TTBR0_EL1` is already saved and not yet used by a call to
+    /// Panics if a previous value of `TTBRn_EL1` is already saved and not yet used by a call to
     /// `deactivate`.
-    #[cfg(target_arch = "aarch64")]
-    pub fn activate(&mut self) {
+    ///
+    /// In test builds or builds that do not target aarch64, the `TTBRn_EL1` access is omitted.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the page table doesn't unmap any memory which the program is
+    /// using, or introduce aliases which break Rust's aliasing rules. The page table must not be
+    /// dropped as long as its mappings are required, as it will automatically be deactivated when
+    /// it is dropped.
+    pub unsafe fn activate(&mut self) {
         self.mapping.activate()
     }
 
-    /// Deactivates the page table, by setting `TTBR0_EL1` back to the value it had before
+    /// Deactivates the page table, by setting `TTBRn_EL1` back to the value it had before
     /// [`activate`](Self::activate) was called, and invalidating the TLB for this page table's
     /// configured ASID.
     ///
-    /// Panics if there is no saved `TTRB0_EL1` value because `activate` has not previously been
+    /// Panics if there is no saved `TTBRn_EL1` value because `activate` has not previously been
     /// called.
-    #[cfg(target_arch = "aarch64")]
-    pub fn deactivate(&mut self) {
+    ///
+    /// In test builds or builds that do not target aarch64, the `TTBRn_EL1` access is omitted.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the previous page table which this is switching back to doesn't
+    /// unmap any memory which the program is using.
+    pub unsafe fn deactivate(&mut self) {
         self.mapping.deactivate()
     }
 
@@ -151,19 +165,72 @@ impl LinearMap {
     ///
     /// Returns [`MapError::AddressRange`] if the largest address in the `range` is greater than the
     /// largest virtual address covered by the page table given its root level.
+    ///
+    /// Returns [`MapError::InvalidFlags`] if the `flags` argument has unsupported attributes set.
+    ///
+    /// Returns [`MapError::BreakBeforeMakeViolation'] if the range intersects with live mappings,
+    /// and modifying those would violate architectural break-before-make (BBM) requirements.
     pub fn map_range(&mut self, range: &MemoryRegion, flags: Attributes) -> Result<(), MapError> {
+        self.map_range_with_constraints(range, flags, Constraints::empty())
+    }
+
+    /// Maps the given range of virtual addresses to the corresponding physical addresses with the
+    /// given flags, taking the given constraints into account.
+    ///
+    /// This should generally only be called while the page table is not active. In particular, any
+    /// change that may require break-before-make per the architecture must be made while the page
+    /// table is inactive. Mapping a previously unmapped memory range may be done while the page
+    /// table is active. This function writes block and page entries, but only maps them if `flags`
+    /// contains `Attributes::VALID`, otherwise the entries remain invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MapError::InvalidVirtualAddress`] if adding the configured offset to any virtual
+    /// address within the `range` would result in overflow.
+    ///
+    /// Returns [`MapError::RegionBackwards`] if the range is backwards.
+    ///
+    /// Returns [`MapError::AddressRange`] if the largest address in the `range` is greater than the
+    /// largest virtual address covered by the page table given its root level.
+    ///
+    /// Returns [`MapError::InvalidFlags`] if the `flags` argument has unsupported attributes set.
+    ///
+    /// Returns [`MapError::BreakBeforeMakeViolation'] if the range intersects with live mappings,
+    /// and modifying those would violate architectural break-before-make (BBM) requirements.
+    pub fn map_range_with_constraints(
+        &mut self,
+        range: &MemoryRegion,
+        flags: Attributes,
+        constraints: Constraints,
+    ) -> Result<(), MapError> {
         let pa = self
             .mapping
             .root
             .translation()
             .virtual_to_physical(range.start())?;
-        self.mapping.map_range(range, pa, flags)
+        self.mapping.map_range(range, pa, flags, constraints)
     }
 
-    /// Applies the provided updater function to a number of PTEs corresponding to a given memory range.
+    /// Applies the provided updater function to the page table descriptors covering a given
+    /// memory range.
     ///
-    /// The virtual address range passed to the updater function may be expanded compared to the
-    /// `range` parameter, due to alignment to block boundaries.
+    /// This may involve splitting block entries if the provided range is not currently mapped
+    /// down to its precise boundaries. For visiting all the descriptors covering a memory range
+    /// without potential splitting (and no descriptor updates), use
+    /// [`walk_range`](Self::walk_range) instead.
+    ///
+    /// The updater function receives the following arguments:
+    ///
+    /// - The virtual address range mapped by each page table descriptor. A new descriptor will
+    ///   have been allocated before the invocation of the updater function if a page table split
+    ///   was needed.
+    /// - A mutable reference to the page table descriptor that permits modifications.
+    /// - The level of a translation table the descriptor belongs to.
+    ///
+    /// The updater function should return:
+    ///
+    /// - `Ok` to continue updating the remaining entries.
+    /// - `Err` to signal an error and stop updating the remaining entries.
     ///
     /// This should generally only be called while the page table is not active. In particular, any
     /// change that may require break-before-make per the architecture must be made while the page
@@ -178,8 +245,44 @@ impl LinearMap {
     ///
     /// Returns [`MapError::AddressRange`] if the largest address in the `range` is greater than the
     /// largest virtual address covered by the page table given its root level.
-    pub fn modify_range(&mut self, range: &MemoryRegion, f: &PteUpdater) -> Result<(), MapError> {
+    ///
+    /// Returns [`MapError::BreakBeforeMakeViolation'] if the range intersects with live mappings,
+    /// and modifying those would violate architectural break-before-make (BBM) requirements.
+    pub fn modify_range<F>(&mut self, range: &MemoryRegion, f: &F) -> Result<(), MapError>
+    where
+        F: Fn(&MemoryRegion, &mut Descriptor, usize) -> Result<(), ()> + ?Sized,
+    {
         self.mapping.modify_range(range, f)
+    }
+
+    /// Applies the provided callback function to the page table descriptors covering a given
+    /// memory range.
+    ///
+    /// The callback function receives the following arguments:
+    ///
+    /// - The full virtual address range mapped by each visited page table descriptor, which may
+    ///   exceed the original range passed to `walk_range`, due to alignment to block boundaries.
+    /// - The page table descriptor itself.
+    /// - The level of a translation table the descriptor belongs to.
+    ///
+    /// The callback function should return:
+    ///
+    /// - `Ok` to continue visiting the remaining entries.
+    /// - `Err` to signal an error and stop visiting the remaining entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MapError::PteUpdateFault`] if the callback function returns an error.
+    ///
+    /// Returns [`MapError::RegionBackwards`] if the range is backwards.
+    ///
+    /// Returns [`MapError::AddressRange`] if the largest address in the `range` is greater than the
+    /// largest virtual address covered by the page table given its root level.
+    pub fn walk_range<F>(&self, range: &MemoryRegion, f: &mut F) -> Result<(), MapError>
+    where
+        F: FnMut(&MemoryRegion, &Descriptor, usize) -> Result<(), ()>,
+    {
+        self.mapping.walk_range(range, f)
     }
 }
 
@@ -327,7 +430,7 @@ mod tests {
 
         // One byte, with an offset which would map it to a negative IPA.
         assert_eq!(
-            pagetable.map_range(&MemoryRegion::new(0, 1), Attributes::NORMAL),
+            pagetable.map_range(&MemoryRegion::new(0, 1), Attributes::NORMAL,),
             Err(MapError::InvalidVirtualAddress(VirtualAddress(0)))
         );
     }
