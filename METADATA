@@ -11,13 +11,13 @@ third_party {
   }
   url {
     type: ARCHIVE
-    value: "https://static.crates.io/crates/aarch64-paging/aarch64-paging-0.4.1.crate"
+    value: "https://static.crates.io/crates/aarch64-paging/aarch64-paging-0.5.0.crate"
   }
-  version: "0.4.1"
+  version: "0.5.0"
   license_type: NOTICE
   last_upgrade_date {
     year: 2023
-    month: 7
-    day: 21
+    month: 10
+    day: 25
   }
 }
