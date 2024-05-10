@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.5.0
+
+### Bug fixes
+
+- Reject the `PAGE_OR_TABLE` flag when passed to `map_range`, which would result in corrupt table
+  mappings to be created.
+
+### Breaking changes
+
+- Updated `modify_range` to split block entries before traversing them, and pass only the
+  descriptors and subregions that are completely covered by the given region to the updater callback
+  function.
+- Updated `modify_range` to only pass block or page descriptors to the callback function and prevent
+  them from being converted into table descriptors inadvertently.
+- Added rigid break-before-make (BBM) checks to `map_range` and `modify_range`.
+- Marked `activate` and `deactivate` methods as unsafe.
+
+### New features
+
+- Added new `map_range()` alternative `map_range_with_constraints()` with extra `contraints`
+  argument.
+- Added `walk_range` method that iterates over all block or page descriptorsthat intersect with a
+  given region, without permitting the callback to make changes to the descriptors
+
+## 0.4.1
+
+### Bug fixes
+
+- `RootTable`, `Mapping`, `IdMap` and `LinearMap` are now correctly marked as `Send`, as it doesn't
+  matter where they are used from.
+
+## 0.4.0
+
+### Breaking changes
+
+- Updated `bitflags` to 2.0.2, which changes the API of `Attributes` a bit.
+- Updated `map_range` method to support mapping leaf page table entries without the `VALID` flag.
+  `Attributes::VALID` is no longer implicitly set when mapping leaf page table entries.
+
+### New features
+
+- Added `modify_range` method to `IdMap`, `LinearMap` and `Mapping` to update details of a mapped
+  range. This can be used e.g. to change flags for some range which is already mapped. As part of
+  this, the `Descriptor` struct was added to the public API.
+- Added `DBM` and software flags to `Attributes`.
+
 ## 0.3.0
 
 ### Breaking changes
