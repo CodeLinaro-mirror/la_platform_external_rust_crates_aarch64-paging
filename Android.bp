@@ -48,7 +48,7 @@ rust_test {
     crate_name: "aarch64_paging",
     cargo_env_compat: true,
     cargo_pkg_version: "0.5.0",
-    srcs: ["src/lib.rs"],
+    crate_root: "src/lib.rs",
     test_suites: ["general-tests"],
     auto_gen_config: true,
     test_options: {
@@ -74,7 +74,7 @@ rust_library_rlib {
     crate_name: "aarch64_paging",
     cargo_env_compat: true,
     cargo_pkg_version: "0.5.0",
-    srcs: ["src/lib.rs"],
+    crate_root: "src/lib.rs",
     edition: "2021",
     features: [
         "alloc",
