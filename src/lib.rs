@@ -6,13 +6,12 @@
 //!
 //! Currently it only supports:
 //!   - stage 1 page tables
-//!   - EL1
 //!   - 4 KiB pages
+//!   - EL3, NS-EL2, NS-EL2&0 and NS-EL1&0 translation regimes
 //!
 //! Full support is provided for identity mapping ([`IdMap`](idmap::IdMap)) and linear mapping
 //! ([`LinearMap`](linearmap::LinearMap)). If you want to use a different mapping scheme, you must
-//! provide an implementation of the [`Translation`](paging::Translation) trait and then use
-//! [`Mapping`] directly.
+//! provide an implementation of the [`Translation`] trait and then use [`Mapping`] directly.
 //!
 //! # Example
 //!
@@ -20,18 +19,19 @@
 //! # #[cfg(feature = "alloc")] {
 //! use aarch64_paging::{
 //!     idmap::IdMap,
-//!     paging::{Attributes, MemoryRegion},
+//!     paging::{Attributes, MemoryRegion, TranslationRegime},
 //! };
 //!
 //! const ASID: usize = 1;
 //! const ROOT_LEVEL: usize = 1;
+//! const NORMAL_CACHEABLE: Attributes = Attributes::ATTRIBUTE_INDEX_1.union(Attributes::INNER_SHAREABLE);
 //!
-//! // Create a new page table with identity mapping.
-//! let mut idmap = IdMap::new(ASID, ROOT_LEVEL);
+//! // Create a new EL1 page table with identity mapping.
+//! let mut idmap = IdMap::new(ASID, ROOT_LEVEL, TranslationRegime::El1And0);
 //! // Map a 2 MiB region of memory as read-write.
 //! idmap.map_range(
 //!     &MemoryRegion::new(0x80200000, 0x80400000),
-//!     Attributes::NORMAL | Attributes::NON_GLOBAL | Attributes::VALID,
+//!     NORMAL_CACHEABLE | Attributes::NON_GLOBAL | Attributes::VALID | Attributes::ACCESSED,
 //! ).unwrap();
 //! // SAFETY: Everything the program uses is within the 2 MiB region mapped above.
 //! unsafe {
@@ -58,7 +58,7 @@ use core::arch::asm;
 use core::fmt::{self, Display, Formatter};
 use paging::{
     Attributes, Constraints, Descriptor, MemoryRegion, PhysicalAddress, RootTable, Translation,
-    VaRange, VirtualAddress,
+    TranslationRegime, VaRange, VirtualAddress,
 };
 
 /// An error attempting to map some range in the page table.
@@ -110,7 +110,7 @@ impl Display for MapError {
 /// switch back to a previous static page table, and then `activate` again after making the desired
 /// changes.
 #[derive(Debug)]
-pub struct Mapping<T: Translation + Clone> {
+pub struct Mapping<T: Translation> {
     root: RootTable<T>,
     #[allow(unused)]
     asid: usize,
@@ -118,11 +118,20 @@ pub struct Mapping<T: Translation + Clone> {
     previous_ttbr: Option<usize>,
 }
 
-impl<T: Translation + Clone> Mapping<T> {
+impl<T: Translation> Mapping<T> {
     /// Creates a new page table with the given ASID, root level and translation mapping.
-    pub fn new(translation: T, asid: usize, rootlevel: usize, va_range: VaRange) -> Self {
+    pub fn new(
+        translation: T,
+        asid: usize,
+        rootlevel: usize,
+        translation_regime: TranslationRegime,
+        va_range: VaRange,
+    ) -> Self {
+        if !translation_regime.supports_asid() && asid != 0 {
+            panic!("{:?} doesn't support ASID, must be 0.", translation_regime);
+        }
         Self {
-            root: RootTable::new(translation, rootlevel, va_range),
+            root: RootTable::new(translation, rootlevel, translation_regime, va_range),
             asid,
             previous_ttbr: None,
         }
@@ -133,13 +142,13 @@ impl<T: Translation + Clone> Mapping<T> {
         self.previous_ttbr.is_some()
     }
 
-    /// Activates the page table by setting `TTBRn_EL1` to point to it, and saves the previous value
-    /// of `TTBRn_EL1` so that it may later be restored by [`deactivate`](Self::deactivate).
+    /// Activates the page table by setting `TTBRn_ELx` to point to it, and saves the previous value
+    /// of `TTBRn_ELx` so that it may later be restored by [`deactivate`](Self::deactivate).
     ///
-    /// Panics if a previous value of `TTBRn_EL1` is already saved and not yet used by a call to
+    /// Panics if a previous value of `TTBRn_ELx` is already saved and not yet used by a call to
     /// `deactivate`.
     ///
-    /// In test builds or builds that do not target aarch64, the `TTBRn_EL1` access is omitted.
+    /// In test builds or builds that do not target aarch64, the `TTBRn_ELx` access is omitted.
     ///
     /// # Safety
     ///
@@ -154,40 +163,75 @@ impl<T: Translation + Clone> Mapping<T> {
         let mut previous_ttbr = usize::MAX;
 
         #[cfg(all(not(test), target_arch = "aarch64"))]
-        // SAFETY: Safe because we trust that self.root.to_physical() returns a valid physical
-        // address of a page table, and the `Drop` implementation will reset `TTBRn_EL1` before it
-        // becomes invalid.
+        // SAFETY: Safe because we trust that self.root_address() returns a valid physical address
+        // of a page table, and the `Drop` implementation will reset `TTBRn_ELx` before it becomes
+        // invalid.
         unsafe {
-            match self.root.va_range() {
-                VaRange::Lower => asm!(
+            match (self.root.translation_regime(), self.root.va_range()) {
+                (TranslationRegime::El1And0, VaRange::Lower) => asm!(
                     "mrs   {previous_ttbr}, ttbr0_el1",
                     "msr   ttbr0_el1, {ttbrval}",
                     "isb",
-                    ttbrval = in(reg) self.root.to_physical().0 | (self.asid << 48),
+                    ttbrval = in(reg) self.root_address().0 | (self.asid << 48),
                     previous_ttbr = out(reg) previous_ttbr,
                     options(preserves_flags),
                 ),
-                VaRange::Upper => asm!(
+                (TranslationRegime::El1And0, VaRange::Upper) => asm!(
                     "mrs   {previous_ttbr}, ttbr1_el1",
                     "msr   ttbr1_el1, {ttbrval}",
                     "isb",
-                    ttbrval = in(reg) self.root.to_physical().0 | (self.asid << 48),
+                    ttbrval = in(reg) self.root_address().0 | (self.asid << 48),
                     previous_ttbr = out(reg) previous_ttbr,
                     options(preserves_flags),
                 ),
+                (TranslationRegime::El2And0, VaRange::Lower) => asm!(
+                    "mrs   {previous_ttbr}, ttbr0_el2",
+                    "msr   ttbr0_el2, {ttbrval}",
+                    "isb",
+                    ttbrval = in(reg) self.root_address().0 | (self.asid << 48),
+                    previous_ttbr = out(reg) previous_ttbr,
+                    options(preserves_flags),
+                ),
+                (TranslationRegime::El2And0, VaRange::Upper) => asm!(
+                    "mrs   {previous_ttbr}, s3_4_c2_c0_1", // ttbr1_el2
+                    "msr   s3_4_c2_c0_1, {ttbrval}",
+                    "isb",
+                    ttbrval = in(reg) self.root_address().0 | (self.asid << 48),
+                    previous_ttbr = out(reg) previous_ttbr,
+                    options(preserves_flags),
+                ),
+                (TranslationRegime::El2, VaRange::Lower) => asm!(
+                    "mrs   {previous_ttbr}, ttbr0_el2",
+                    "msr   ttbr0_el2, {ttbrval}",
+                    "isb",
+                    ttbrval = in(reg) self.root_address().0,
+                    previous_ttbr = out(reg) previous_ttbr,
+                    options(preserves_flags),
+                ),
+                (TranslationRegime::El3, VaRange::Lower) => asm!(
+                    "mrs   {previous_ttbr}, ttbr0_el3",
+                    "msr   ttbr0_el3, {ttbrval}",
+                    "isb",
+                    ttbrval = in(reg) self.root_address().0,
+                    previous_ttbr = out(reg) previous_ttbr,
+                    options(preserves_flags),
+                ),
+                _ => {
+                    panic!("Invalid combination of exception level and VA range.");
+                }
             }
         }
-        self.previous_ttbr = Some(previous_ttbr);
+        self.mark_active(previous_ttbr);
     }
 
-    /// Deactivates the page table, by setting `TTBRn_EL1` back to the value it had before
+    /// Deactivates the page table, by setting `TTBRn_ELx` back to the value it had before
     /// [`activate`](Self::activate) was called, and invalidating the TLB for this page table's
     /// configured ASID.
     ///
-    /// Panics if there is no saved `TTBRn_EL1` value because `activate` has not previously been
+    /// Panics if there is no saved `TTBRn_ELx` value because `activate` has not previously been
     /// called.
     ///
-    /// In test builds or builds that do not target aarch64, the `TTBRn_EL1` access is omitted.
+    /// In test builds or builds that do not target aarch64, the `TTBRn_ELx` access is omitted.
     ///
     /// # Safety
     ///
@@ -197,11 +241,11 @@ impl<T: Translation + Clone> Mapping<T> {
         assert!(self.active());
 
         #[cfg(all(not(test), target_arch = "aarch64"))]
-        // SAFETY: Safe because this just restores the previously saved value of `TTBRn_EL1`, which
+        // SAFETY: Safe because this just restores the previously saved value of `TTBRn_ELx`, which
         // must have been valid.
         unsafe {
-            match self.root.va_range() {
-                VaRange::Lower => asm!(
+            match (self.root.translation_regime(), self.root.va_range()) {
+                (TranslationRegime::El1And0, VaRange::Lower) => asm!(
                     "msr   ttbr0_el1, {ttbrval}",
                     "isb",
                     "tlbi  aside1, {asid}",
@@ -211,7 +255,7 @@ impl<T: Translation + Clone> Mapping<T> {
                     ttbrval = in(reg) self.previous_ttbr.unwrap(),
                     options(preserves_flags),
                 ),
-                VaRange::Upper => asm!(
+                (TranslationRegime::El1And0, VaRange::Upper) => asm!(
                     "msr   ttbr1_el1, {ttbrval}",
                     "isb",
                     "tlbi  aside1, {asid}",
@@ -221,9 +265,38 @@ impl<T: Translation + Clone> Mapping<T> {
                     ttbrval = in(reg) self.previous_ttbr.unwrap(),
                     options(preserves_flags),
                 ),
+                (TranslationRegime::El2And0, VaRange::Lower) => asm!(
+                    "msr   ttbr0_el2, {ttbrval}",
+                    "isb",
+                    "tlbi  aside1, {asid}",
+                    "dsb   nsh",
+                    "isb",
+                    asid = in(reg) self.asid << 48,
+                    ttbrval = in(reg) self.previous_ttbr.unwrap(),
+                    options(preserves_flags),
+                ),
+                (TranslationRegime::El2And0, VaRange::Upper) => asm!(
+                    "msr   s3_4_c2_c0_1, {ttbrval}", // ttbr1_el2
+                    "isb",
+                    "tlbi  aside1, {asid}",
+                    "dsb   nsh",
+                    "isb",
+                    asid = in(reg) self.asid << 48,
+                    ttbrval = in(reg) self.previous_ttbr.unwrap(),
+                    options(preserves_flags),
+                ),
+                (TranslationRegime::El2, VaRange::Lower) => {
+                    panic!("EL2 page table can't safety be deactivated.");
+                }
+                (TranslationRegime::El3, VaRange::Lower) => {
+                    panic!("EL3 page table can't safety be deactivated.");
+                }
+                _ => {
+                    panic!("Invalid combination of exception level and VA range.");
+                }
             }
         }
-        self.previous_ttbr = None;
+        self.mark_inactive();
     }
 
     /// Checks whether the given range can be mapped or updated while the translation is live,
@@ -232,21 +305,23 @@ impl<T: Translation + Clone> Mapping<T> {
     where
         F: Fn(&MemoryRegion, &mut Descriptor, usize) -> Result<(), ()> + ?Sized,
     {
-        self.walk_range(
+        self.root.visit_range(
             range,
             &mut |mr: &MemoryRegion, d: &Descriptor, level: usize| {
                 if d.is_valid() {
+                    let err = MapError::BreakBeforeMakeViolation(mr.clone());
+
                     if !mr.is_block(level) {
                         // Cannot split a live block mapping
-                        return Err(());
+                        return Err(err);
                     }
 
                     // Get the new flags and output address for this descriptor by applying
                     // the updater function to a copy
                     let (flags, oa) = {
                         let mut dd = *d;
-                        updater(mr, &mut dd, level)?;
-                        (dd.flags().ok_or(())?, dd.output_address())
+                        updater(mr, &mut dd, level).or(Err(err.clone()))?;
+                        (dd.flags().ok_or(err.clone())?, dd.output_address())
                     };
 
                     if !flags.contains(Attributes::VALID) {
@@ -256,26 +331,26 @@ impl<T: Translation + Clone> Mapping<T> {
 
                     if oa != d.output_address() {
                         // Cannot change output address on a live mapping
-                        return Err(());
+                        return Err(err);
                     }
 
                     let desc_flags = d.flags().unwrap();
 
-                    if (desc_flags ^ flags).intersects(Attributes::NORMAL) {
+                    if (desc_flags ^ flags).intersects(
+                        Attributes::ATTRIBUTE_INDEX_MASK | Attributes::SHAREABILITY_MASK,
+                    ) {
                         // Cannot change memory type
-                        return Err(());
+                        return Err(err);
                     }
 
                     if (desc_flags - flags).contains(Attributes::NON_GLOBAL) {
                         // Cannot convert from non-global to global
-                        return Err(());
+                        return Err(err);
                     }
                 }
                 Ok(())
             },
         )
-        .map_err(|_| MapError::BreakBeforeMakeViolation(range.clone()))?;
-        Ok(())
     }
 
     /// Maps the given range of virtual addresses to the corresponding range of physical addresses
@@ -381,9 +456,40 @@ impl<T: Translation + Clone> Mapping<T> {
     {
         self.root.walk_range(range, f)
     }
+
+    /// Returns the physical address of the root table.
+    ///
+    /// This may be used to activate the page table by setting the appropriate TTBRn_ELx if you wish
+    /// to do so yourself rather than by calling [`activate`](Self::activate). Make sure to call
+    /// [`mark_active`](Self::mark_active) after doing so.
+    pub fn root_address(&self) -> PhysicalAddress {
+        self.root.to_physical()
+    }
+
+    /// Marks the page table as active.
+    ///
+    /// This should be called if the page table is manually activated by calling
+    /// [`root_address`](Self::root_address) and setting some TTBR with it. This will cause
+    /// [`map_range`](Self::map_range) and [`modify_range`](Self::modify_range) to perform extra
+    /// checks to avoid violating break-before-make requirements.
+    ///
+    /// It is called automatically by [`activate`](Self::activate).
+    pub fn mark_active(&mut self, previous_ttbr: usize) {
+        self.previous_ttbr = Some(previous_ttbr);
+    }
+
+    /// Marks the page table as inactive.
+    ///
+    /// This may be called after manually disabling the use of the page table, such as by setting
+    /// the relevant TTBR to a different address.
+    ///
+    /// It is called automatically by [`deactivate`](Self::deactivate).
+    pub fn mark_inactive(&mut self) {
+        self.previous_ttbr = None;
+    }
 }
 
-impl<T: Translation + Clone> Drop for Mapping<T> {
+impl<T: Translation> Drop for Mapping<T> {
     fn drop(&mut self) {
         if self.previous_ttbr.is_some() {
             #[cfg(target_arch = "aarch64")]
@@ -393,5 +499,27 @@ impl<T: Translation + Clone> Drop for Mapping<T> {
                 self.deactivate();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "alloc")]
+    use self::idmap::IdTranslation;
+    #[cfg(feature = "alloc")]
+    use super::*;
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    #[should_panic]
+    fn no_el2_asid() {
+        Mapping::new(IdTranslation, 1, 1, TranslationRegime::El2, VaRange::Lower);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    #[should_panic]
+    fn no_el3_asid() {
+        Mapping::new(IdTranslation, 1, 1, TranslationRegime::El3, VaRange::Lower);
     }
 }
