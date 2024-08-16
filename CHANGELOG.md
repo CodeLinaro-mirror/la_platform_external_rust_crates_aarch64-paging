@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.7.0
+
+### Breaking changes
+
+- `Translation::allocate_table` and `Translation::deallocate_table` now takes `&mut self` rather
+  than `&self.
+
+### Other changes
+
+- The `Translation` type parameter to `Mapping` no longer needs to be `Clone`.
+- `IdMap`, `LinearMap`, `Mapping` and `RootTable` are now `Sync`.
+
+## 0.6.0
+
+### Breaking changes
+
+- Added support for EL2 and EL3 page tables. This requires a new parameter to `IdMap::new`,
+  `LinearMap::new`, `Mapping::new` and `RootTable::new`.
+- `Attributes::EXECUTE_NEVER` renamed to `Attributes::UXN`.
+- `Attributes::DEVICE_NGNRE` and `NORMAL` have been removed in favour of `ATTRIBUTE_INDEX_*`,
+  `OUTER_SHAREABLE` and `INNER_SHAREABLE`, to avoid making assumptions about how the MAIR registers
+  are programmed.
+
+### New features
+
+- Added `root_address`, `mark_active` and `mark_inactive` methods to `IdMap`, `LinearMap` and
+  `Mapping`. These may be used to activate and deactivate the page table manually rather than
+  calling `activate` and `deactivate`.
+- Added `NS` and `PXN` bits to `Attributes`.
+
+### Bug fixes
+
+- When an invalid descriptor is split into a table, the table descriptors aren't set unless to
+  non-zero values unless the original descriptor was.
+
+### Other changes
+
+- `Attributes::ACCESSED` is no longer automatically set on all new mappings. To maintain existing
+  behaviour you should explicitly set `Attributes::ACCESSED` whenever calling `map_range` for a
+  valid mapping.
+
 ## 0.5.0
 
 ### Bug fixes
