@@ -12,12 +12,12 @@
 [package]
 edition = "2021"
 name = "aarch64-paging"
-version = "0.5.0"
+version = "0.7.0"
 authors = [
     "Ard Biesheuvel <ardb@google.com>",
     "Andrew Walbran <qwandor@google.com>",
 ]
-description = "A library to manipulate AArch64 VMSA EL1 page tables."
+description = "A library to manipulate AArch64 VMSA page tables."
 readme = "README.md"
 keywords = [
     "arm",
@@ -39,7 +39,7 @@ all-features = true
 default-target = "aarch64-unknown-none"
 
 [dependencies.bitflags]
-version = "2.0.2"
+version = "2.6.0"
 
 [features]
 alloc = []

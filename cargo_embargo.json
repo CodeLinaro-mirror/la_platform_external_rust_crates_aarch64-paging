@@ -9,7 +9,8 @@
       "alloc": true,
       "no_std": true,
       "force_rlib": true,
-      "add_module_block": "cargo2android_module.bp"
+      "add_module_block": "cargo2android_module.bp",
+      "license_text": "LICENSE.android"
     }
   },
   "run_cargo": false
